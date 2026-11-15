@@ -30,6 +30,9 @@
     <ClCompile Include="..\transcoder\basisu_transcoder.cpp">
       <Filter>Source Files\transcoder</Filter>
     </ClCompile>
+    <ClCompile Include="..\transcoder\basisu_hdr_transcode.cpp">
+      <Filter>Source Files\transcoder</Filter>
+    </ClCompile>
     <ClCompile Include="..\encoder\basisu_uastc_hdr_4x4_enc.cpp">
       <Filter>Source Files\encoder</Filter>
     </ClCompile>
@@ -135,6 +138,9 @@
       <Filter>Source Files\transcoder</Filter>
     </ClInclude>
     <ClInclude Include="..\transcoder\basisu_astc_hdr_core.h">
+      <Filter>Source Files\transcoder</Filter>
+    </ClInclude>
+    <ClInclude Include="..\transcoder\basisu_hdr_transcode.h">
       <Filter>Source Files\transcoder</Filter>
     </ClInclude>
     <ClInclude Include="..\transcoder\basisu_containers.h">

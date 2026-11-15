@@ -30,6 +30,7 @@
 #include "encoder/basisu_backend.h"
 #include "encoder/basisu_comp.h"
 #include "transcoder/basisu_transcoder.h"
+#include "transcoder/basisu_hdr_transcode.h"
 #include "encoder/basisu_ssim.h"
 #include "encoder/basisu_opencl.h"
 #include "encoder/basisu_astc_ldr_common.h"
@@ -104,6 +105,7 @@ enum tool_mode
 	cTestHDR_4x4,
 	cTestHDR_6x6,
 	cTestHDR_6x6i,
+	cTestHDRTranscode,
 	cTestXUASTCLDR,
 	cTestCodecs,
 	cTestCodecsGen,
@@ -1628,6 +1630,8 @@ public:
 				m_mode = cTestHDR_6x6;
 			else if (opt_match(pArg, "-test_hdr_6x6i"))
 				m_mode = cTestHDR_6x6i;
+			else if (opt_match(pArg, "-test_hdr_transcode"))
+				m_mode = cTestHDRTranscode;
 			else if (opt_match(pArg, "-test_codecs"))
 			{
 				// Sweep all LDR+HDR codecs vs the golden .inl table. Optional trailing codec
@@ -7182,6 +7186,399 @@ static bool test_mode_hdr(command_line_params& opts, basist::basis_tex_format te
 	return result;
 }
 
+
+// ------------------------------------------------------------------------------------------------------------------------------
+// -test_hdr_transcode: tests the checked HDR transcoding policy layer (transcoder/basisu_hdr_transcode.h):
+// UASTC HDR 4x4 input -> ASTC HDR 4x4 / BC6H / RGB(A)_HALF outputs, exposure handling, NaN/Inf/negative/out-of-range
+// sanitization, missing alpha, unsupported targets, and block-level BC6H error selection. All failures must be explicit
+// error codes, never silent black output. SDR paths are not involved here (they are covered by -test/-test_codecs).
+// ------------------------------------------------------------------------------------------------------------------------------
+static double hdr_test_log2_psnr(const basist::half_float* pRef, const basist::half_float* pTest, uint32_t num_values)
+{
+	const double floor_v = 1.0 / 65504.0;
+	double mse = 0.0;
+	for (uint32_t i = 0; i < num_values; i++)
+	{
+		const double a = log2(basisu::maximum<double>(astc_helpers::half_to_float(pRef[i]), floor_v));
+		const double b = log2(basisu::maximum<double>(astc_helpers::half_to_float(pTest[i]), floor_v));
+		const double d = a - b;
+		mse += d * d;
+	}
+	mse /= (double)num_values;
+	if (mse <= 1e-12)
+		return 999.0;
+	const double peak = 32.0; // log2(65504) - log2(1/65504)
+	return 10.0 * log10(peak * peak / mse);
+}
+
+static bool test_mode_hdr_transcode(command_line_params& opts)
+{
+	BASISU_NOTE_UNUSED(opts);
+
+	using namespace basist;
+
+	uint32_t total_failures = 0;
+
+#define HDR_TRANSCODE_CHECK(cond, msg) \
+	do { \
+		if (!(cond)) { error_printf("test_mode_hdr_transcode: FAILED check \"%s\" (%s:%u)\n", msg, __FILE__, __LINE__); total_failures++; } \
+		else { printf("  OK: %s\n", msg); } \
+	} while(0)
+
+	printf("test_mode_hdr_transcode: testing checked HDR transcode layer (basisu_hdr_transcode.h/.cpp)\n");
+
+	// ----------------------------------------------------------------
+	// 1. Build a synthetic HDR image and compress it to UASTC HDR 4x4.
+	// ----------------------------------------------------------------
+	const uint32_t IMG_W = 64, IMG_H = 64;
+	imagef img(IMG_W, IMG_H);
+	for (uint32_t y = 0; y < IMG_H; y++)
+	{
+		for (uint32_t x = 0; x < IMG_W; x++)
+		{
+			float r = (x / 63.0f) * 4.0f;
+			float g = (y / 63.0f) * 2.0f;
+			float b = ((x ^ y) & 8) ? 100.0f : 0.25f;
+			if ((x >= 48) && (y >= 48))
+			{
+				// Very bright corner (large dynamic range)
+				r = 1000.0f; g = 500.0f; b = 0.5f;
+			}
+			img(x, y) = vec4F(r, g, b, 1.0f);
+		}
+	}
+
+	basisu::vector<imagef> source_images(1);
+	source_images[0] = img;
+
+	size_t basis_size = 0;
+	image_stats comp_stats;
+	void* pBasis = basis_compress(basist::basis_tex_format::cUASTC_HDR_4x4, source_images, 0, 0.0f, &basis_size, &comp_stats);
+	HDR_TRANSCODE_CHECK(pBasis != nullptr, "basis_compress() to UASTC HDR 4x4");
+	if (!pBasis)
+		return false;
+
+	basist::basisu_transcoder dec;
+	if (!dec.start_transcoding(pBasis, (uint32_t)basis_size))
+	{
+		error_printf("test_mode_hdr_transcode: start_transcoding() failed\n");
+		basis_free_data(pBasis);
+		return false;
+	}
+
+	basist::basisu_image_level_info level_info;
+	HDR_TRANSCODE_CHECK(dec.get_image_level_info(pBasis, (uint32_t)basis_size, level_info, 0, 0), "get_image_level_info()");
+
+	const uint32_t num_blocks_x = level_info.m_num_blocks_x;
+	const uint32_t num_blocks_y = level_info.m_num_blocks_y;
+	const uint32_t total_blocks = level_info.m_total_blocks;
+	printf("  Image %ux%u, %ux%u blocks\n", level_info.m_orig_width, level_info.m_orig_height, num_blocks_x, num_blocks_y);
+
+	// Extract the raw UASTC HDR 4x4 blocks using the existing (unchanged) passthrough path.
+	basisu::vector<basist::astc_blk> src_blocks(total_blocks);
+	HDR_TRANSCODE_CHECK(dec.transcode_image_level(pBasis, (uint32_t)basis_size, 0, 0, src_blocks.data(), total_blocks,
+		basist::transcoder_texture_format::cTFASTC_HDR_4x4_RGBA, 0), "extract raw UASTC HDR 4x4 blocks (existing passthrough)");
+
+	const uint32_t src_data_size = total_blocks * (uint32_t)sizeof(basist::astc_blk);
+
+	// ----------------------------------------------------------------
+	// 2. ASTC HDR passthrough: checked slice must be bit-identical, and
+	//    exposure on a passthrough target must fail explicitly.
+	// ----------------------------------------------------------------
+	{
+		basisu::vector<basist::astc_blk> out_blocks(total_blocks);
+		basist::hdr_transcode_stats stats;
+		basist::hdr_transcode_error err = basist::transcode_uastc_hdr_4x4_slice_checked(
+			out_blocks.data(), num_blocks_x, num_blocks_y,
+			(const uint8_t*)src_blocks.data(), src_data_size,
+			basist::transcoder_texture_format::cTFASTC_HDR_4x4_RGBA,
+			IMG_W, IMG_H, 0, nullptr, &stats);
+		HDR_TRANSCODE_CHECK(err == basist::hdr_transcode_error::cSuccess, "ASTC HDR 4x4 checked passthrough succeeds");
+		HDR_TRANSCODE_CHECK(memcmp(out_blocks.data(), src_blocks.data(), src_data_size) == 0, "ASTC HDR 4x4 passthrough is bit-identical");
+		HDR_TRANSCODE_CHECK(stats.m_num_blocks == total_blocks, "passthrough processed all blocks");
+
+		basist::hdr_transcode_options exp_opts;
+		exp_opts.m_exposure_scale = 2.0f;
+		err = basist::transcode_uastc_hdr_4x4_slice_checked(
+			out_blocks.data(), num_blocks_x, num_blocks_y,
+			(const uint8_t*)src_blocks.data(), src_data_size,
+			basist::transcoder_texture_format::cTFASTC_HDR_4x4_RGBA,
+			IMG_W, IMG_H, 0, &exp_opts, nullptr);
+		HDR_TRANSCODE_CHECK(err == basist::hdr_transcode_error::cUnsupportedOperation, "exposure on ASTC HDR passthrough fails explicitly (cUnsupportedOperation)");
+	}
+
+	// ----------------------------------------------------------------
+	// 3. BC6H: block-level error-selected transcode, quality vs. the
+	//    existing direct endpoint transcode path.
+	// ----------------------------------------------------------------
+	{
+		basisu::vector<basist::bc6h_block> new_bc6h(total_blocks);
+		basist::hdr_transcode_stats stats;
+		basist::hdr_transcode_error err = basist::transcode_uastc_hdr_4x4_slice_checked(
+			new_bc6h.data(), num_blocks_x, num_blocks_y,
+			(const uint8_t*)src_blocks.data(), src_data_size,
+			basist::transcoder_texture_format::cTFBC6H,
+			IMG_W, IMG_H, 0, nullptr, &stats);
+		HDR_TRANSCODE_CHECK(err == basist::hdr_transcode_error::cSuccess, "BC6H checked slice transcode succeeds");
+		HDR_TRANSCODE_CHECK(stats.m_num_blocks == total_blocks, "BC6H transcode processed all blocks");
+		printf("  BC6H candidate selection: direct=%u reencoded=%u solid=%u, avg err=%f, max err=%f\n",
+			stats.m_num_direct_transcodes, stats.m_num_reencoded, stats.m_num_solid_fallbacks,
+			stats.m_num_blocks ? stats.m_total_error / stats.m_num_blocks : 0.0, stats.m_max_error);
+
+		// Reference: the existing (unchanged) UASTC HDR -> BC6H path.
+		basisu::vector<basist::bc6h_block> old_bc6h(total_blocks);
+		HDR_TRANSCODE_CHECK(dec.transcode_image_level(pBasis, (uint32_t)basis_size, 0, 0, old_bc6h.data(), total_blocks,
+			basist::transcoder_texture_format::cTFBC6H, 0), "existing UASTC HDR -> BC6H path still works");
+
+		// Decode both to half texels and compare log2 PSNR against the sanitized source.
+		basisu::vector<basist::half_float> src_halfs(total_blocks * 48), new_halfs(total_blocks * 48), old_halfs(total_blocks * 48);
+		basist::hdr_transcode_options def_opts;
+		uint32_t undecodable_new = 0, undecodable_old = 0, undecodable_src = 0;
+		for (uint32_t i = 0; i < total_blocks; i++)
+		{
+			basist::half_float rgba[64];
+			basist::hdr_transcode_error derr = basist::decode_uastc_hdr_4x4_block_checked(src_blocks[i], rgba, def_opts, nullptr);
+			if (derr != basist::hdr_transcode_error::cSuccess)
+				undecodable_src++;
+			for (uint32_t t = 0; t < 16; t++)
+				for (uint32_t c = 0; c < 3; c++)
+					src_halfs[i * 48 + t * 3 + c] = rgba[t * 4 + c];
+
+			if (!basist::unpack_bc6h_checked(&new_bc6h[i], &new_halfs[i * 48], false))
+				undecodable_new++;
+			if (!basist::unpack_bc6h_checked(&old_bc6h[i], &old_halfs[i * 48], false))
+				undecodable_old++;
+		}
+		HDR_TRANSCODE_CHECK(undecodable_src == 0, "all source blocks decode (checked)");
+		HDR_TRANSCODE_CHECK(undecodable_new == 0, "all new BC6H blocks decode");
+		HDR_TRANSCODE_CHECK(undecodable_old == 0, "all reference BC6H blocks decode");
+
+		// Differential check: the new bounded BC6H decoder must match the encoder's
+		// reference BC6H decoder (basisu::unpack_bc6h) bit-exactly on all blocks.
+		{
+			uint32_t decode_mismatches = 0;
+			for (uint32_t i = 0; i < total_blocks; i++)
+			{
+				basist::half_float ref_rgb[48];
+				if (!basisu::unpack_bc6h(&new_bc6h[i], ref_rgb, false))
+				{
+					decode_mismatches++;
+					continue;
+				}
+				if (memcmp(ref_rgb, &new_halfs[i * 48], sizeof(ref_rgb)) != 0)
+					decode_mismatches++;
+			}
+			HDR_TRANSCODE_CHECK(decode_mismatches == 0, "checked BC6H decoder matches encoder reference decoder bit-exactly");
+		}
+
+		const double new_psnr = hdr_test_log2_psnr(src_halfs.data(), new_halfs.data(), total_blocks * 48);
+		const double old_psnr = hdr_test_log2_psnr(src_halfs.data(), old_halfs.data(), total_blocks * 48);
+		printf("  BC6H log2 PSNR: checked=%.3f dB, existing=%.3f dB\n", new_psnr, old_psnr);
+		HDR_TRANSCODE_CHECK(new_psnr > 20.0, "BC6H checked transcode quality sane (> 20 dB)");
+		HDR_TRANSCODE_CHECK(new_psnr >= old_psnr - 0.5, "BC6H checked transcode not worse than existing path (-0.5 dB tolerance)");
+	}
+
+	// ----------------------------------------------------------------
+	// 4. Exposure: RGBA_HALF output with 2.0x exposure must be ~2x the
+	//    1.0x output (where unclamped), and alpha must be opaque.
+	// ----------------------------------------------------------------
+	{
+		const uint32_t total_pixels = IMG_W * IMG_H;
+		basisu::vector<basist::half_float> out_1x(total_pixels * 4), out_2x(total_pixels * 4);
+
+		basist::hdr_transcode_options opts_1x, opts_2x;
+		opts_2x.m_exposure_scale = 2.0f;
+
+		basist::hdr_transcode_error err = basist::transcode_uastc_hdr_4x4_slice_checked(
+			out_1x.data(), num_blocks_x, num_blocks_y, (const uint8_t*)src_blocks.data(), src_data_size,
+			basist::transcoder_texture_format::cTFRGBA_HALF, IMG_W, IMG_H, 0, &opts_1x, nullptr);
+		HDR_TRANSCODE_CHECK(err == basist::hdr_transcode_error::cSuccess, "RGBA_HALF transcode (exposure 1.0)");
+
+		err = basist::transcode_uastc_hdr_4x4_slice_checked(
+			out_2x.data(), num_blocks_x, num_blocks_y, (const uint8_t*)src_blocks.data(), src_data_size,
+			basist::transcoder_texture_format::cTFRGBA_HALF, IMG_W, IMG_H, 0, &opts_2x, nullptr);
+		HDR_TRANSCODE_CHECK(err == basist::hdr_transcode_error::cSuccess, "RGBA_HALF transcode (exposure 2.0)");
+
+		uint32_t bad_ratios = 0, checked_ratios = 0, bad_alpha = 0;
+		for (uint32_t i = 0; i < total_pixels; i++)
+		{
+			for (uint32_t c = 0; c < 3; c++)
+			{
+				const float v1 = astc_helpers::half_to_float(out_1x[i * 4 + c]);
+				const float v2 = astc_helpers::half_to_float(out_2x[i * 4 + c]);
+				if ((v1 > 0.01f) && (v1 < 10000.0f))
+				{
+					checked_ratios++;
+					if (fabsf(v2 - 2.0f * v1) > 0.03f * 2.0f * v1)
+						bad_ratios++;
+				}
+			}
+			if (astc_helpers::half_to_float(out_2x[i * 4 + 3]) != 1.0f)
+				bad_alpha++;
+		}
+		printf("  Exposure ratio check: %u values checked, %u bad; alpha: %u bad\n", checked_ratios, bad_ratios, bad_alpha);
+		HDR_TRANSCODE_CHECK(checked_ratios > 0, "exposure test had checkable values");
+		HDR_TRANSCODE_CHECK(bad_ratios == 0, "exposure 2.0 doubles unclamped texels");
+		HDR_TRANSCODE_CHECK(bad_alpha == 0, "missing alpha forced to opaque 1.0");
+
+		// Invalid exposures must fail explicitly.
+		basist::hdr_transcode_options bad_opts;
+		bad_opts.m_exposure_scale = 0.0f;
+		err = basist::transcode_uastc_hdr_4x4_slice_checked(out_1x.data(), num_blocks_x, num_blocks_y, (const uint8_t*)src_blocks.data(), src_data_size,
+			basist::transcoder_texture_format::cTFRGBA_HALF, IMG_W, IMG_H, 0, &bad_opts, nullptr);
+		HDR_TRANSCODE_CHECK(err == basist::hdr_transcode_error::cInvalidExposure, "exposure 0 fails with cInvalidExposure");
+
+		bad_opts.m_exposure_scale = std::numeric_limits<float>::quiet_NaN();
+		err = basist::transcode_uastc_hdr_4x4_slice_checked(out_1x.data(), num_blocks_x, num_blocks_y, (const uint8_t*)src_blocks.data(), src_data_size,
+			basist::transcoder_texture_format::cTFRGBA_HALF, IMG_W, IMG_H, 0, &bad_opts, nullptr);
+		HDR_TRANSCODE_CHECK(err == basist::hdr_transcode_error::cInvalidExposure, "exposure NaN fails with cInvalidExposure");
+
+		bad_opts.m_exposure_scale = 1.0e9f;
+		err = basist::transcode_uastc_hdr_4x4_slice_checked(out_1x.data(), num_blocks_x, num_blocks_y, (const uint8_t*)src_blocks.data(), src_data_size,
+			basist::transcoder_texture_format::cTFRGBA_HALF, IMG_W, IMG_H, 0, &bad_opts, nullptr);
+		HDR_TRANSCODE_CHECK(err == basist::hdr_transcode_error::cInvalidExposure, "unbounded exposure fails with cInvalidExposure");
+	}
+
+	// ----------------------------------------------------------------
+	// 5. Sanitization unit tests: NaN/Inf, negatives, huge values.
+	// ----------------------------------------------------------------
+	{
+		basist::half_float texels[8];
+		// NaN (exp all 1's, mantissa nonzero), +Inf, -Inf, normal
+		texels[0] = 0x7E00; texels[1] = 0x7C00; texels[2] = 0xFC00; texels[3] = astc_helpers::float_to_half(1.5f, true);
+		texels[4] = 0x7BFF; texels[5] = 0x7BFF; texels[6] = 0x7BFF; texels[7] = 0x7BFF;
+
+		basist::hdr_transcode_options opts;
+		basist::hdr_transcode_stats stats;
+
+		// fail_on_nan_inf (default): explicit error, no silent output
+		basist::half_float tmp[8];
+		memcpy(tmp, texels, sizeof(tmp));
+		basist::hdr_transcode_error err = basist::sanitize_hdr_texels(tmp, 2, 4, opts, &stats);
+		HDR_TRANSCODE_CHECK(err == basist::hdr_transcode_error::cNanInfInput, "NaN/Inf input fails explicitly with cNanInfInput");
+
+		// sanitize mode: NaN->0, +Inf->max, -Inf->0
+		opts.m_fail_on_nan_inf = false;
+		stats.clear();
+		memcpy(tmp, texels, sizeof(tmp));
+		err = basist::sanitize_hdr_texels(tmp, 2, 4, opts, &stats);
+		HDR_TRANSCODE_CHECK(err == basist::hdr_transcode_error::cSuccess, "NaN/Inf sanitization succeeds when allowed");
+		HDR_TRANSCODE_CHECK(stats.m_num_nan_inf_sanitized == 3, "3 NaN/Inf values sanitized");
+		HDR_TRANSCODE_CHECK(astc_helpers::half_to_float(tmp[0]) == 0.0f, "NaN sanitized to 0");
+		HDR_TRANSCODE_CHECK(astc_helpers::half_to_float(tmp[1]) == 65504.0f, "+Inf sanitized to max");
+		HDR_TRANSCODE_CHECK(astc_helpers::half_to_float(tmp[2]) == 0.0f, "-Inf sanitized to 0");
+		HDR_TRANSCODE_CHECK(fabsf(astc_helpers::half_to_float(tmp[3]) - 1.5f) < 0.01f, "normal value untouched");
+
+		// negatives clamped
+		opts.m_fail_on_nan_inf = true;
+		stats.clear();
+		tmp[0] = astc_helpers::float_to_half(-3.0f, true);
+		tmp[1] = astc_helpers::float_to_half(2.0f, true);
+		err = basist::sanitize_hdr_texels(tmp, 1, 2, opts, &stats);
+		HDR_TRANSCODE_CHECK(err == basist::hdr_transcode_error::cSuccess, "negative sanitize succeeds");
+		HDR_TRANSCODE_CHECK(astc_helpers::half_to_float(tmp[0]) == 0.0f, "negative clamped to 0");
+		HDR_TRANSCODE_CHECK(stats.m_num_negatives_clamped == 1, "negative clamp counted");
+
+		// huge dynamic range: max half * exposure 256 must clamp, not overflow to Inf
+		opts.m_exposure_scale = 256.0f;
+		stats.clear();
+		tmp[0] = 0x7BFF; // 65504
+		tmp[1] = astc_helpers::float_to_half(0.5f, true);
+		err = basist::sanitize_hdr_texels(tmp, 1, 2, opts, &stats);
+		HDR_TRANSCODE_CHECK(err == basist::hdr_transcode_error::cSuccess, "huge value * max exposure succeeds");
+		HDR_TRANSCODE_CHECK(astc_helpers::half_to_float(tmp[0]) == 65504.0f, "huge value clamped to half max (no Inf)");
+		HDR_TRANSCODE_CHECK(stats.m_num_values_clamped == 1, "range clamp counted");
+		HDR_TRANSCODE_CHECK(fabsf(astc_helpers::half_to_float(tmp[1]) - 128.0f) < 0.5f, "0.5 * 256 == 128");
+
+		// negative passthrough (clamp_negatives=false) with large exposure must stay finite, not become -Inf
+		opts.m_clamp_negatives = false;
+		stats.clear();
+		tmp[0] = astc_helpers::float_to_half(-1000.0f, true);
+		err = basist::sanitize_hdr_texels(tmp, 1, 1, opts, &stats);
+		HDR_TRANSCODE_CHECK(err == basist::hdr_transcode_error::cSuccess, "negative passthrough with exposure succeeds");
+		HDR_TRANSCODE_CHECK(astc_helpers::half_to_float(tmp[0]) == -65504.0f, "negative passthrough clamped to -max (no -Inf)");
+
+		// exposure stops helper
+		HDR_TRANSCODE_CHECK(fabsf(basist::hdr_exposure_stops_to_scale(1.0f) - 2.0f) < 1e-4f, "1 stop == 2.0x linear");
+		HDR_TRANSCODE_CHECK(basist::hdr_exposure_stops_to_scale(std::numeric_limits<float>::quiet_NaN()) == 0.0f, "NaN stops rejected");
+	}
+
+	// ----------------------------------------------------------------
+	// 6. Unsupported targets and bad arguments: explicit errors.
+	// ----------------------------------------------------------------
+	{
+		basisu::vector<basist::bc6h_block> out_bc6h(total_blocks);
+		basist::hdr_transcode_error err;
+
+		// SDR targets must be rejected explicitly (the checked layer is HDR-only; SDR paths are separate and unchanged).
+		err = basist::transcode_uastc_hdr_4x4_slice_checked(out_bc6h.data(), num_blocks_x, num_blocks_y,
+			(const uint8_t*)src_blocks.data(), src_data_size, basist::transcoder_texture_format::cTFBC1_RGB, IMG_W, IMG_H);
+		HDR_TRANSCODE_CHECK(err == basist::hdr_transcode_error::cUnsupportedTargetFormat, "SDR target BC1 rejected with cUnsupportedTargetFormat");
+
+		err = basist::transcode_uastc_hdr_4x4_slice_checked(out_bc6h.data(), num_blocks_x, num_blocks_y,
+			(const uint8_t*)src_blocks.data(), src_data_size, basist::transcoder_texture_format::cTFRGBA32, IMG_W, IMG_H);
+		HDR_TRANSCODE_CHECK(err == basist::hdr_transcode_error::cUnsupportedTargetFormat, "LDR RGBA32 target rejected with cUnsupportedTargetFormat");
+
+		err = basist::transcode_uastc_hdr_4x4_slice_checked(out_bc6h.data(), num_blocks_x, num_blocks_y,
+			(const uint8_t*)src_blocks.data(), src_data_size, basist::transcoder_texture_format::cTFRGB_9E5, IMG_W, IMG_H);
+		HDR_TRANSCODE_CHECK(err == basist::hdr_transcode_error::cUnsupportedTargetFormat, "RGB9E5 target rejected with cUnsupportedTargetFormat");
+
+		// Truncated input
+		err = basist::transcode_uastc_hdr_4x4_slice_checked(out_bc6h.data(), num_blocks_x, num_blocks_y,
+			(const uint8_t*)src_blocks.data(), src_data_size - 1, basist::transcoder_texture_format::cTFBC6H, IMG_W, IMG_H);
+		HDR_TRANSCODE_CHECK(err == basist::hdr_transcode_error::cDataTooSmall, "truncated input fails with cDataTooSmall");
+
+		// Null/bad args
+		err = basist::transcode_uastc_hdr_4x4_slice_checked(nullptr, num_blocks_x, num_blocks_y,
+			(const uint8_t*)src_blocks.data(), src_data_size, basist::transcoder_texture_format::cTFBC6H, IMG_W, IMG_H);
+		HDR_TRANSCODE_CHECK(err == basist::hdr_transcode_error::cInvalidArgument, "null output fails with cInvalidArgument");
+
+		err = basist::transcode_uastc_hdr_4x4_slice_checked(out_bc6h.data(), 0, num_blocks_y,
+			(const uint8_t*)src_blocks.data(), src_data_size, basist::transcoder_texture_format::cTFBC6H, IMG_W, IMG_H);
+		HDR_TRANSCODE_CHECK(err == basist::hdr_transcode_error::cInvalidArgument, "zero width fails with cInvalidArgument");
+	}
+
+	// ----------------------------------------------------------------
+	// 7. Corrupted block data: must return an explicit error or valid
+	//    output - never crash, never silently emit black.
+	// ----------------------------------------------------------------
+	{
+		uint8_t fuzz_block[16];
+		fill_buffer_with_random_bytes(fuzz_block, sizeof(fuzz_block));
+
+		basist::bc6h_block out_blk;
+		memset(&out_blk, 0xCD, sizeof(out_blk));
+		basist::hdr_transcode_options opts;
+		basist::hdr_transcode_error err = basist::transcode_uastc_hdr_4x4_block_to_bc6h(
+			*(const basist::astc_blk*)fuzz_block, out_blk, opts, nullptr);
+		printf("  Corrupt block result: %s\n", basist::hdr_transcode_error_to_string(err));
+		if (err == basist::hdr_transcode_error::cSuccess)
+		{
+			// If the random block happened to be valid ASTC, the output must decode.
+			basist::half_float rgb[48];
+			HDR_TRANSCODE_CHECK(basist::unpack_bc6h_checked(&out_blk, rgb, false), "corrupt-but-valid block yields decodable BC6H");
+		}
+		else
+		{
+			HDR_TRANSCODE_CHECK(err != basist::hdr_transcode_error::cSuccess, "corrupt block fails with explicit error");
+		}
+
+		// Error threshold: an impossibly tight threshold must fail explicitly.
+		basist::hdr_transcode_options strict_opts;
+		strict_opts.m_max_block_error = 1e-9;
+		err = basist::transcode_uastc_hdr_4x4_block_to_bc6h(src_blocks[total_blocks / 2], out_blk, strict_opts, nullptr);
+		HDR_TRANSCODE_CHECK(err == basist::hdr_transcode_error::cErrorTooHigh, "impossible error threshold fails with cErrorTooHigh");
+	}
+
+	basis_free_data(pBasis);
+
+	printf("test_mode_hdr_transcode: %s (%u failures)\n", total_failures ? "FAILED" : "succeeded", total_failures);
+
+#undef HDR_TRANSCODE_CHECK
+
+	return total_failures == 0;
+}
+
 const uint32_t XUASTC_LDR_TEST_FILE_NUM_RUNS = 3;
 
 struct xuastc_ldr_test_file
@@ -9891,6 +10288,9 @@ static int main_internal(int argc, const char** argv)
 		break;
 	case cTestHDR_6x6:
 		status = test_mode_hdr(opts, basist::basis_tex_format::cASTC_HDR_6x6, std::size(g_hdr_6x6_test_files), g_hdr_6x6_test_files, 0.0f);
+		break;
+	case cTestHDRTranscode:
+		status = test_mode_hdr_transcode(opts);
 		break;
 	case cTestHDR_6x6i:
 		status = test_mode_hdr(opts, basist::basis_tex_format::cUASTC_HDR_6x6_INTERMEDIATE, std::size(g_hdr_6x6i_test_files), g_hdr_6x6i_test_files, 0.0f);

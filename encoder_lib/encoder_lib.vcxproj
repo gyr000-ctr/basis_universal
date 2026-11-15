@@ -59,6 +59,7 @@
     <ClCompile Include="..\encoder\jpgd.cpp" />
     <ClCompile Include="..\encoder\pvpngreader.cpp" />
     <ClCompile Include="..\transcoder\basisu_transcoder.cpp" />
+    <ClCompile Include="..\transcoder\basisu_hdr_transcode.cpp" />
     <ClCompile Include="..\zstd\zstd.c" />
   </ItemGroup>
   <ItemGroup>
@@ -106,6 +107,7 @@
     <ClInclude Include="..\transcoder\basisu_astc_helpers.h" />
     <ClInclude Include="..\transcoder\basisu.h" />
     <ClInclude Include="..\transcoder\basisu_astc_hdr_core.h" />
+    <ClInclude Include="..\transcoder\basisu_hdr_transcode.h" />
     <ClInclude Include="..\transcoder\basisu_containers.h" />
     <ClInclude Include="..\transcoder\basisu_containers_impl.h" />
     <ClInclude Include="..\transcoder\basisu_file_headers.h" />

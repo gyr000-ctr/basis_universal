@@ -265,6 +265,7 @@ set(ENCODER_LIB_SRC_LIST
     encoder/basisu_xbc7_encode.cpp
     encoder/basisu_tinyexr.cpp
     transcoder/basisu_transcoder.cpp
+    transcoder/basisu_hdr_transcode.cpp
     encoder/basisu_astc_hdr_6x6_enc.h
     encoder/basisu_astc_hdr_common.h
     encoder/basisu_backend.h
@@ -305,6 +306,7 @@ set(ENCODER_LIB_SRC_LIST
     encoder/3rdparty/tinyexr.h
     transcoder/basisu_astc_hdr_core.h
     transcoder/basisu_astc_helpers.h
+    transcoder/basisu_hdr_transcode.h
     transcoder/basisu_containers_impl.h
     transcoder/basisu_containers.h
     transcoder/basisu_file_headers.h

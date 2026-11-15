@@ -416,6 +416,11 @@ sizes, disable RGB dual plane (-xp) and subset usage (-xs).
  -test_hdr_4x4/-test_hdr_6x6/-test_hdr_6x6i: Run automated UASTC HDR encoding
   and transcoding tests. Returns EXIT_FAILURE on any failures.
 
+ -test_hdr_transcode: Run automated tests of the checked UASTC HDR 4x4
+  transcoding layer (ASTC HDR/BC6H/RGB(A)_HALF outputs, exposure, NaN/Inf,
+  negative and out-of-range sanitization, alpha policy, unsupported targets,
+  block-level BC6H error selection). Returns EXIT_FAILURE on any failures.
+
  -test_xuastc: Run an automated XUASTC LDR encoding and transcoding test.
   Returns EXIT_FAILURE on any failures.
 
