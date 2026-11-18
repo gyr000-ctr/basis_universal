@@ -1,4 +1,4 @@
-﻿// basisu_transcoder.cpp
+// basisu_transcoder.cpp
 // Copyright (C) 2019-2026 Binomial LLC. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -2993,6 +2993,29 @@ namespace basist
 		}
 	}
 #endif //BASISD_SUPPORT_DXT5A
+
+	// Converts an ETC1S grayscale block (an alpha slice) to a BC2/DXT3 explicit 4-bit alpha block.
+	// Texel i (raster order) is stored at bits 4*i..4*i+3 of the 64-bit output block (little endian), matching the DXT3 layout.
+	static void convert_etc1s_to_bc2_alpha(void* pDst_block, const endpoint* pEndpoints, const selector* pSelector)
+	{
+		color32 block_colors[4];
+		decoder_etc_block::get_block_colors5(block_colors, pEndpoints->m_color5, pEndpoints->m_inten5);
+
+		// ETC1S alpha slices store grayscale in the R channel (same convention as convert_etc1s_to_dxt5a).
+		// Round to nearest when quantizing 8->4 bits: 0 -> 0 and 255 -> 15 exactly, so punchthrough-style
+		// alpha (all 0's or all 255's) transcodes to exact 0/F nibbles.
+		uint8_t alpha4[4];
+		for (uint32_t i = 0; i < 4; i++)
+			alpha4[i] = static_cast<uint8_t>((block_colors[i].r * 15 + 127) / 255);
+
+		uint8_t* pDst = static_cast<uint8_t*>(pDst_block);
+		for (uint32_t t = 0; t < 16; t += 2)
+		{
+			const uint32_t s0 = pSelector->get_selector(t & 3, t >> 2);
+			const uint32_t s1 = pSelector->get_selector((t + 1) & 3, (t + 1) >> 2);
+			pDst[t >> 1] = static_cast<uint8_t>(alpha4[s0] | (alpha4[s1] << 4));
+		}
+	}
 
 	// PVRTC
 
@@ -8898,6 +8921,12 @@ namespace basist
 #endif
 					break;
 				}
+				case block_format::cBC2_ALPHA:
+				{
+					void* pDst_block = static_cast<uint8_t*>(pDst_blocks) + (block_x + block_y * output_row_pitch_in_blocks_or_pixels) * output_block_or_pixel_stride_in_bytes;
+					convert_etc1s_to_bc2_alpha(pDst_block, pEndpoints, pSelector);
+					break;
+				}
 				case block_format::cPVRTC1_4_RGB:
 				{
 #if BASISD_SUPPORT_PVRTC1
@@ -9808,6 +9837,44 @@ namespace basist
 			break;
 #endif
 		}
+		case transcoder_texture_format::cTFBC2_RGBA:
+		{
+#if !BASISD_SUPPORT_DXT1
+			BASISU_DEVEL_ERROR("basisu_lowlevel_etc1s_transcoder::transcode_image: DXT1 unsupported\n");
+			return false;
+#else
+			assert(bytes_per_block_or_pixel == 16);
+
+			// BC2/DXT3: 8 bytes of explicit 4-bit alpha, then a BC1 color block (always 4-color, like BC3).
+			// First decode the alpha data to explicit 4-bit alpha blocks.
+			if (basis_file_has_alpha_slices)
+			{
+				status = transcode_slice(pOutput_blocks, num_blocks_x, num_blocks_y, pCompressed_data + alpha_offset, alpha_length, block_format::cBC2_ALPHA, bytes_per_block_or_pixel, false, is_video, true, level_index, orig_width, orig_height, output_row_pitch_in_blocks_or_pixels, pState, false, nullptr, output_rows_in_pixels, decode_flags);
+			}
+			else
+			{
+				basisu_transcoder::write_opaque_alpha_blocks(num_blocks_x, num_blocks_y, pOutput_blocks, block_format::cBC2_ALPHA, 16, output_row_pitch_in_blocks_or_pixels);
+				status = true;
+			}
+
+			if (status)
+			{
+				// Now decode the color data. 3 color (punchthrough) blocks are forbidden, exactly like BC3:
+				// in BC2 the alpha channel lives in the explicit alpha block, so the color block must always be 4-color.
+				status = transcode_slice((uint8_t*)pOutput_blocks + 8, num_blocks_x, num_blocks_y, pCompressed_data + rgb_offset, rgb_length, block_format::cBC1, bytes_per_block_or_pixel, false, is_video, false, level_index, orig_width, orig_height, output_row_pitch_in_blocks_or_pixels, pState, false, nullptr, output_rows_in_pixels, decode_flags);
+				if (!status)
+				{
+					BASISU_DEVEL_ERROR("basisu_lowlevel_etc1s_transcoder::transcode_image: transcode_slice() to BC2 RGB failed\n");
+				}
+			}
+			else
+			{
+				BASISU_DEVEL_ERROR("basisu_lowlevel_etc1s_transcoder::transcode_image: transcode_slice() to BC2 A failed\n");
+			}
+
+			break;
+#endif
+		}
 		case transcoder_texture_format::cTFBC5_RG:
 		{
 #if !BASISD_SUPPORT_DXT5A
@@ -10240,6 +10307,11 @@ namespace basist
 						status = transcode_uastc_to_bc3(*pSource_block, pDst_block, high_quality);
 						break;
 					}
+					case block_format::cBC2:
+					{
+						status = transcode_uastc_to_bc2(*pSource_block, pDst_block, high_quality);
+						break;
+					}
 					case block_format::cBC4:
 					{
 						if (channel0 < 0) 
@@ -10499,6 +10571,16 @@ namespace basist
 			if (!status)
 			{
 				BASISU_DEVEL_ERROR("basisu_lowlevel_uastc_ldr_4x4_transcoder::transcode_image: transcode_slice() to BC3 failed\n");
+			}
+			break;
+		}
+		case transcoder_texture_format::cTFBC2_RGBA:
+		{
+			status = transcode_slice(pOutput_blocks, num_blocks_x, num_blocks_y, pCompressed_data + slice_offset, slice_length, block_format::cBC2,
+				bytes_per_block_or_pixel, false, has_alpha, orig_width, orig_height, output_row_pitch_in_blocks_or_pixels, pState, output_rows_in_pixels, channel0, channel1, decode_flags);
+			if (!status)
+			{
+				BASISU_DEVEL_ERROR("basisu_lowlevel_uastc_ldr_4x4_transcoder::transcode_image: transcode_slice() to BC2 failed\n");
 			}
 			break;
 		}
@@ -13089,6 +13171,19 @@ namespace basist
 			}
 #endif
 		}
+		else if (fmt == block_format::cBC2_ALPHA)
+		{
+			// Opaque BC2/DXT3 alpha: every 4-bit explicit alpha value is 0xF.
+			for (uint32_t y = 0; y < num_blocks_y; y++)
+			{
+				uint32_t dst_ofs = y * output_row_pitch_in_blocks_or_pixels * block_stride_in_bytes;
+				for (uint32_t x = 0; x < num_blocks_x; x++)
+				{
+					memset((uint8_t*)pOutput_blocks + dst_ofs, 0xFF, 8);
+					dst_ofs += block_stride_in_bytes;
+				}
+			}
+		}
 	}
 
 	bool basisu_transcoder::transcode_image_level(
@@ -13339,6 +13434,7 @@ namespace basist
 		case transcoder_texture_format::cTFBC6H:
 		case transcoder_texture_format::cTFETC2_RGBA:
 		case transcoder_texture_format::cTFBC3_RGBA:
+		case transcoder_texture_format::cTFBC2_RGBA:
 		case transcoder_texture_format::cTFBC5_RG:
 
 		case transcoder_texture_format::cTFASTC_LDR_4x4_RGBA:
@@ -13394,6 +13490,7 @@ namespace basist
 		case transcoder_texture_format::cTFBC7_ALT: return "BC7_RGBA";
 		case transcoder_texture_format::cTFETC2_RGBA: return "ETC2_RGBA";
 		case transcoder_texture_format::cTFBC3_RGBA: return "BC3_RGBA";
+		case transcoder_texture_format::cTFBC2_RGBA: return "BC2_RGBA";
 		case transcoder_texture_format::cTFBC5_RG: return "BC5_RG";
 		
 		case transcoder_texture_format::cTFASTC_HDR_4x4_RGBA: return "ASTC_HDR_4X4_RGBA";
@@ -13494,6 +13591,8 @@ namespace basist
 		case block_format::cBC7: return "BC7";
 		case block_format::cETC2_RGBA: return "ETC2_RGBA";
 		case block_format::cBC3: return "BC3";
+		case block_format::cBC2: return "BC2";
+		case block_format::cBC2_ALPHA: return "BC2_ALPHA";
 		
 		case block_format::cASTC_LDR_4x4: return "ASTC_LDR_4x4";
 		case block_format::cASTC_LDR_5x4: return "ASTC_LDR_5x4";
@@ -13560,6 +13659,7 @@ namespace basist
 		{
 		case transcoder_texture_format::cTFETC2_RGBA:
 		case transcoder_texture_format::cTFBC3_RGBA:
+		case transcoder_texture_format::cTFBC2_RGBA:
 		
 		case transcoder_texture_format::cTFASTC_LDR_4x4_RGBA:
 		case transcoder_texture_format::cTFASTC_LDR_5x4_RGBA:
@@ -13650,6 +13750,7 @@ namespace basist
 		case transcoder_texture_format::cTFBC7_ALT: return basisu::texture_format::cBC7;
 		case transcoder_texture_format::cTFETC2_RGBA: return basisu::texture_format::cETC2_RGBA;
 		case transcoder_texture_format::cTFBC3_RGBA: return basisu::texture_format::cBC3;
+		case transcoder_texture_format::cTFBC2_RGBA: return basisu::texture_format::cBC2;
 		case transcoder_texture_format::cTFBC5_RG: return basisu::texture_format::cBC5;
 
 		case transcoder_texture_format::cTFASTC_LDR_4x4_RGBA: return basisu::texture_format::cASTC_LDR_4x4;
@@ -14120,6 +14221,7 @@ namespace basist
 			switch (tex_type)
 			{
 			case transcoder_texture_format::cTFBC1_RGB:
+			case transcoder_texture_format::cTFBC2_RGBA:
 			case transcoder_texture_format::cTFBC3_RGBA:
 			case transcoder_texture_format::cTFBC4_R:
 			case transcoder_texture_format::cTFBC5_RG:
@@ -14254,6 +14356,7 @@ namespace basist
 			{
 			case transcoder_texture_format::cTFASTC_LDR_4x4_RGBA:
 			case transcoder_texture_format::cTFBC1_RGB:
+			case transcoder_texture_format::cTFBC2_RGBA:
 			case transcoder_texture_format::cTFBC3_RGBA:
 			case transcoder_texture_format::cTFBC4_R:
 			case transcoder_texture_format::cTFBC5_RG:
@@ -14289,6 +14392,7 @@ namespace basist
 				return true;
 #if BASISD_SUPPORT_DXT1
 			case transcoder_texture_format::cTFBC1_RGB:
+			case transcoder_texture_format::cTFBC2_RGBA:
 				return true;
 #endif
 #if BASISD_SUPPORT_DXT5A
@@ -18873,6 +18977,60 @@ namespace basist
 
 		basist::encode_bc4(pBC4_block, &block_pixels[0][0].a, sizeof(color32));
 
+		if ((!high_quality) && (unpacked_src_blk.m_bc1_hint0))
+			transcode_uastc_to_bc1_hint0(unpacked_src_blk, pBC1_block);
+		else
+		{
+			if (unpacked_src_blk.m_bc1_hint1)
+				transcode_uastc_to_bc1_hint1(unpacked_src_blk, block_pixels, pBC1_block, high_quality);
+			else
+				encode_bc1(pBC1_block, &block_pixels[0][0].r, high_quality ? cEncodeBC1HighQuality : 0);
+		}
+
+		return true;
+	}
+
+	// Writes a BC2/DXT3 explicit 4-bit alpha block (texel i at bits 4*i..4*i+3) from 16 8-bit alpha values.
+	static void write_bc2_alpha_block(void* pDst, const uint8_t* pAlpha, uint32_t alpha_stride)
+	{
+		uint8_t* pDst_bytes = static_cast<uint8_t*>(pDst);
+		for (uint32_t t = 0; t < 16; t += 2)
+		{
+			// Round to nearest on the 8->4 bit quantization: 0 -> 0 and 255 -> 15 exactly.
+			const uint32_t a0 = (pAlpha[t * alpha_stride] * 15 + 127) / 255;
+			const uint32_t a1 = (pAlpha[(t + 1) * alpha_stride] * 15 + 127) / 255;
+			pDst_bytes[t >> 1] = static_cast<uint8_t>(a0 | (a1 << 4));
+		}
+	}
+
+	bool transcode_uastc_to_bc2(const uastc_block& src_blk, void* pDst, bool high_quality)
+	{
+		unpacked_uastc_block unpacked_src_blk;
+		if (!unpack_uastc(src_blk, unpacked_src_blk, false))
+			return false;
+
+		const uint32_t mode = unpacked_src_blk.m_mode;
+
+		void* pBC2_alpha_block = pDst;
+		dxt1_block* pBC1_block = &static_cast<dxt1_block*>(pDst)[1];
+
+		if (mode == UASTC_MODE_INDEX_SOLID_COLOR)
+		{
+			const uint8_t a4 = static_cast<uint8_t>((unpacked_src_blk.m_solid_color.a * 15 + 127) / 255);
+			memset(pBC2_alpha_block, a4 | (a4 << 4), 8);
+			encode_bc1_solid_block(pBC1_block, unpacked_src_blk.m_solid_color.r, unpacked_src_blk.m_solid_color.g, unpacked_src_blk.m_solid_color.b);
+			return true;
+		}
+
+		color32 block_pixels[4][4];
+		const bool unpack_srgb = false;
+		if (!unpack_uastc(unpacked_src_blk, &block_pixels[0][0], unpack_srgb))
+			return false;
+
+		write_bc2_alpha_block(pBC2_alpha_block, &block_pixels[0][0].a, sizeof(color32));
+
+		// The color half is encoded exactly like BC3's: opaque 4-color BC1 blocks only (no punchthrough),
+		// because in BC2 the alpha channel comes from the explicit alpha block.
 		if ((!high_quality) && (unpacked_src_blk.m_bc1_hint0))
 			transcode_uastc_to_bc1_hint0(unpacked_src_blk, pBC1_block);
 		else
@@ -42255,6 +42413,15 @@ bool transcode_4x4_block(
 		encode_bc1(pDst_block_u8 + 8, (const uint8_t *)block_pixels, high_quality ? cEncodeBC1HighQuality : 0);
 		break;
 	}
+	case block_format::cBC2:
+	{
+		assert(output_block_or_pixel_stride_in_bytes == 16);
+
+		// DXT3: 8 bytes of explicit 4-bit alpha, then a 4-color BC1 color block (encode_bc1 never emits 3-color/punchthrough blocks).
+		write_bc2_alpha_block(pDst_block_u8, &block_pixels[0].c[3], sizeof(color32));
+		encode_bc1(pDst_block_u8 + 8, (const uint8_t *)block_pixels, high_quality ? cEncodeBC1HighQuality : 0);
+		break;
+	}
 	case block_format::cBC4:
 	{
 		assert(output_block_or_pixel_stride_in_bytes == 8);
@@ -45351,6 +45518,16 @@ bool basisu_lowlevel_xuastc_ldr_transcoder::transcode_image(
 		}
 		break;
 	}
+	case transcoder_texture_format::cTFBC2_RGBA:
+	{
+		status = transcode_slice(src_format, use_astc_srgb_decode_profile, pOutput_blocks, src_num_blocks_x, src_num_blocks_y, pCompressed_data + slice_offset, slice_length, block_format::cBC2,
+			bytes_per_block_or_pixel, false, has_alpha, orig_width, orig_height, output_row_pitch_in_blocks_or_pixels, pState, output_rows_in_pixels, channel0, channel1, decode_flags);
+		if (!status)
+		{
+			BASISU_DEVEL_ERROR("basisu_lowlevel_xuastc_ldr_transcoder::transcode_image: transcode_slice() to BC2 failed\n");
+		}
+		break;
+	}
 	case transcoder_texture_format::cTFBC4_R:
 	{
 		status = transcode_slice(src_format, use_astc_srgb_decode_profile, pOutput_blocks, src_num_blocks_x, src_num_blocks_y, pCompressed_data + slice_offset, slice_length, block_format::cBC4,
@@ -45885,6 +46062,16 @@ bool basisu_lowlevel_xubc7_transcoder::transcode_image(
 		if (!status)
 		{
 			BASISU_DEVEL_ERROR("basisu_lowlevel_xubc7_transcoder::transcode_image: transcode_slice() to BC3 failed\n");
+		}
+		break;
+	}
+	case transcoder_texture_format::cTFBC2_RGBA:
+	{
+		status = transcode_slice(src_tex_format, pOutput_blocks, src_num_blocks_x, src_num_blocks_y, pCompressed_data + slice_offset, slice_length, block_format::cBC2,
+			bytes_per_block_or_pixel, false, has_alpha, orig_width, orig_height, output_row_pitch_in_blocks_or_pixels, pState, output_rows_in_pixels, channel0, channel1, decode_flags);
+		if (!status)
+		{
+			BASISU_DEVEL_ERROR("basisu_lowlevel_xubc7_transcoder::transcode_image: transcode_slice() to BC2 failed\n");
 		}
 		break;
 	}

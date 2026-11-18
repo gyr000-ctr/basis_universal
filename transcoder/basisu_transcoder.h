@@ -61,6 +61,9 @@ namespace basist
 		cTFBC5_RG = 5,								// XY: Two BC4 blocks, X=R and Y=Alpha, .basis file should have alpha data (if not Y will be all 255's)
 		cTFBC7_RGBA = 6,							// RGB or RGBA, mode 5 for ETC1S, modes (1,2,3,5,6,7) for UASTC
 
+		cTFBC2_RGBA = 41,							// Opaque+alpha, DXT3: 8-byte explicit 4-bit/texel alpha block followed by a BC1 block (always 4-color, like BC3). Alpha channel will be opaque for opaque .basis files.
+											// (Value 7 is reserved by the legacy cTFBC7_ALT alias below, so BC2 takes the next free value at the end of the enum.)
+
 		// PVRTC1 4bpp (mobile, PowerVR devices)
 		cTFPVRTC1_4_RGB = 8,						// Opaque only, RGB or alpha if cDecodeFlagsTranscodeAlphaDataToOpaqueFormats flag is specified, nearly lowest quality of any texture format.
 		cTFPVRTC1_4_RGBA = 9,						// Opaque+alpha, most useful for simple opacity maps. If .basis file doesn't have alpha cTFPVRTC1_4_RGB will be used instead. Lowest quality of any supported texture format.
@@ -117,12 +120,13 @@ namespace basist
 		cTFASTC_LDR_12x10_RGBA = 39,
 		cTFASTC_LDR_12x12_RGBA = 40,
 				
-		cTFTotalTextureFormats = 41,
+		cTFTotalTextureFormats = 42,
 
 		// ----- The following are old/legacy enums for compatibility with code compiled against previous versions
 		cTFETC1 = cTFETC1_RGB,
 		cTFETC2 = cTFETC2_RGBA,
 		cTFBC1 = cTFBC1_RGB,
+		cTFBC2 = cTFBC2_RGBA,
 		cTFBC3 = cTFBC3_RGBA,
 		cTFBC4 = cTFBC4_R,
 		cTFBC5 = cTFBC5_RG,
@@ -1521,9 +1525,10 @@ namespace basist
 	// Supported texture types: 2D, 2D+mips, cubemap(+mips), texture array(+mips), cubemap array(+mips).
 	// Rejected (clean failure at init): 1D, volume/3D, BC6H, float/other DXGI/D3DFMT, partial cubemaps.
 	//   NOTE on BC2 (DXT2/DXT3): DECODE-ONLY compatibility kludge. A BC2 source decodes correctly (explicit 4-bit
-	//   alpha + 4-color BC1 color), but there is no cTFBC2 in transcoder_texture_format, so get_format() reports
-	//   cTFBC3_RGBA as a closest-match hint and a BC2 source NEVER passes through verbatim (BC2 alpha != BC3 alpha) --
-	//   it always decode->repacks. get_dds_format() still reports the exact cBC2. No real-time encoding TO BC2.
+	//   alpha + 4-color BC1 color), but a BC2 source NEVER passes through verbatim to cTFBC2_RGBA (the DDS transcoder
+	//   reports cTFBC3_RGBA as a closest-match hint from get_format(), and BC2 alpha != BC3 alpha) -- it always
+	//   decode->repacks. get_dds_format() still reports the exact cBC2. (Encoding TO BC2 from ETC1S/UASTC sources
+	//   IS supported via the cTFBC2_RGBA transcode target.)
 	//
 	// Note on sRGB: is_srgb() is a best-effort colorspace guess (DDS only signals sRGB on DX10/DXGI files,
 	// via the _UNORM vs _UNORM_SRGB format variants; DX9 carries no signaling). Policy: assume sRGB (true)

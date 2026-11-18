@@ -68,6 +68,7 @@ namespace basisu
 		case texture_format::cETC2_RGBA: return "ETC2_RGBA";
 		case texture_format::cETC2_ALPHA: return "ETC2_ALPHA";
 		case texture_format::cBC1: return "BC1";
+		case texture_format::cBC2: return "BC2";
 		case texture_format::cBC3: return "BC3";
 		case texture_format::cBC4: return "BC4";
 		case texture_format::cBC5: return "BC5";
@@ -1006,6 +1007,11 @@ namespace basisu
 			basist::bcu::unpack_bc3(pBlock, reinterpret_cast<basist::color_rgba*>(pPixels));
 			break;
 		}
+		case texture_format::cBC2:
+		{
+			basist::bcu::unpack_bc2(pBlock, reinterpret_cast<basist::color_rgba*>(pPixels));
+			break;
+		}
 		case texture_format::cBC4:
 		{
 			// Unpack to R
@@ -1319,6 +1325,7 @@ namespace basisu
 		KTX_RGBA = 0x1908,
 
 		KTX_COMPRESSED_RGB_S3TC_DXT1_EXT = 0x83F0,
+		KTX_COMPRESSED_RGBA_S3TC_DXT3_EXT = 0x83F2,
 		KTX_COMPRESSED_RGBA_S3TC_DXT5_EXT = 0x83F3,
 		KTX_COMPRESSED_RED_RGTC1_EXT = 0x8DBB,
 		KTX_COMPRESSED_RED_GREEN_RGTC2_EXT = 0x8DBD,
@@ -1332,6 +1339,7 @@ namespace basisu
 		// sRGB GL enums, emitted when exporting an sRGB source (EXT_texture_sRGB / ETC2 / BPTC).
 		// BC7's sRGB enum is KTX_COMPRESSED_SRGB_ALPHA_BPTC_UNORM = 0x8E8D, already defined above.
 		KTX_COMPRESSED_SRGB_S3TC_DXT1_EXT = 0x8C4C,        // BC1 RGB, sRGB
+		KTX_COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT = 0x8C4E,  // BC2 (DXT3), sRGB
 		KTX_COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT = 0x8C4F,  // BC3, sRGB
 		KTX_COMPRESSED_SRGB8_ETC2 = 0x9275,                // ETC2 RGB, sRGB
 		KTX_COMPRESSED_SRGB8_ALPHA8_ETC2_EAC = 0x9279,     // ETC2 RGBA, sRGB
@@ -1491,6 +1499,12 @@ namespace basisu
 		case texture_format::cBC3:
 		{
 			internal_fmt = !astc_srgb_flag ? KTX_COMPRESSED_RGBA_S3TC_DXT5_EXT : KTX_COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT;
+			base_internal_fmt = KTX_RGBA;
+			break;
+		}
+		case texture_format::cBC2:
+		{
+			internal_fmt = !astc_srgb_flag ? KTX_COMPRESSED_RGBA_S3TC_DXT3_EXT : KTX_COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT;
 			base_internal_fmt = KTX_RGBA;
 			break;
 		}
@@ -2710,6 +2724,7 @@ namespace basisu
 		case texture_format::cBC1:
 		case texture_format::cBC1_NV:
 		case texture_format::cBC1_AMD:
+		case texture_format::cBC2:
 		case texture_format::cBC3:
 		case texture_format::cBC4:
 		case texture_format::cBC5:
@@ -2937,6 +2952,8 @@ namespace basisu
 		case KTX_ETC1_RGB8_OES:                        return "ETC1 RGB8";
 		case KTX_COMPRESSED_RGB_S3TC_DXT1_EXT:         return "BC1 (DXT1 RGB)";
 		case KTX_COMPRESSED_SRGB_S3TC_DXT1_EXT:        return "BC1 (DXT1 RGB sRGB)";
+		case KTX_COMPRESSED_RGBA_S3TC_DXT3_EXT:        return "BC2 (DXT3 RGBA)";
+		case KTX_COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT:  return "BC2 (DXT3 RGBA sRGB)";
 		case KTX_COMPRESSED_RGBA_S3TC_DXT5_EXT:        return "BC3 (DXT5 RGBA)";
 		case KTX_COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT:  return "BC3 (DXT5 RGBA sRGB)";
 		case KTX_COMPRESSED_RED_RGTC1_EXT:             return "BC4 (RGTC1 R)";

@@ -566,7 +566,9 @@ namespace basisu
 		cASTC_LDR_10x8,
 		cASTC_LDR_10x10,
 		cASTC_LDR_12x10,
-		cASTC_LDR_12x12
+		cASTC_LDR_12x12,
+
+		cBC2				// DXT3 (8-byte explicit 4-bit alpha block followed by a BC1 block). Appended at the end to keep existing enum values stable.
 	};
 
 	inline bool is_astc(texture_format fmt)

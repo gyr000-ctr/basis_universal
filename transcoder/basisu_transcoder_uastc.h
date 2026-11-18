@@ -273,6 +273,7 @@ namespace basist
 	void transcode_uastc_to_bc1_hint1(const unpacked_uastc_block& unpacked_src_blk, const color32 block_pixels[4][4], void* pDst, bool high_quality);
 
 	bool transcode_uastc_to_bc1(const uastc_block& src_blk, void* pDst, bool high_quality);
+	bool transcode_uastc_to_bc2(const uastc_block& src_blk, void* pDst, bool high_quality);
 	bool transcode_uastc_to_bc3(const uastc_block& src_blk, void* pDst, bool high_quality);
 	bool transcode_uastc_to_bc4(const uastc_block& src_blk, void* pDst, bool high_quality, uint32_t chan0);
 	bool transcode_uastc_to_bc5(const uastc_block& src_blk, void* pDst, bool high_quality, uint32_t chan0, uint32_t chan1);

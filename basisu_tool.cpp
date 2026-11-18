@@ -9488,7 +9488,7 @@ static bool parse_export_ktx_format(const std::string& s, basist::transcoder_tex
 
 	static const struct { const char* pName; tf fmt; } s_map[] =
 	{
-		{ "BC1", tf::cTFBC1_RGB }, { "BC3", tf::cTFBC3_RGBA }, { "BC4", tf::cTFBC4_R }, { "BC5", tf::cTFBC5_RG },
+		{ "BC1", tf::cTFBC1_RGB }, { "BC2", tf::cTFBC2_RGBA }, { "BC3", tf::cTFBC3_RGBA }, { "BC4", tf::cTFBC4_R }, { "BC5", tf::cTFBC5_RG },
 		{ "BC6H", tf::cTFBC6H }, { "BC7", tf::cTFBC7_RGBA },
 		{ "ETC1", tf::cTFETC1_RGB }, { "ETC2", tf::cTFETC2_RGBA },
 		{ "EAC_R11", tf::cTFETC2_EAC_R11 }, { "EAC_RG11", tf::cTFETC2_EAC_RG11 },
@@ -9530,7 +9530,7 @@ static bool export_ktx_mode(command_line_params& opts)
 	basist::transcoder_texture_format fmt;
 	if (!parse_export_ktx_format(opts.m_export_ktx_format, fmt))
 	{
-		error_printf("-export_ktx: invalid/unsupported format \"%s\". Valid: BC1 BC3 BC4 BC5 BC6H BC7 ETC1 ETC2 EAC_R11 EAC_RG11 PVRTC1[_RGB] PVRTC2[_RGB] ASTC ASTC_<WxH> ASTC_HDR_4x4 ASTC_HDR_6x6\n", opts.m_export_ktx_format.c_str());
+		error_printf("-export_ktx: invalid/unsupported format \"%s\". Valid: BC1 BC2 BC3 BC4 BC5 BC6H BC7 ETC1 ETC2 EAC_R11 EAC_RG11 PVRTC1[_RGB] PVRTC2[_RGB] ASTC ASTC_<WxH> ASTC_HDR_4x4 ASTC_HDR_6x6\n", opts.m_export_ktx_format.c_str());
 		return false;
 	}
 

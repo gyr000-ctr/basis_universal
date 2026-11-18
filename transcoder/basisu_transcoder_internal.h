@@ -114,7 +114,11 @@ namespace basist
 		cASTC_LDR_10x10,
 		cASTC_LDR_12x10,
 		cASTC_LDR_12x12,
-										
+
+		// BC2/DXT3 (appended at the end to keep the existing enum values stable)
+		cBC2,								// 8-byte explicit 4-bit/texel alpha block followed by a four color BC1 block
+		cBC2_ALPHA,							// alpha block of BC2 only: 16 explicit 4-bit alpha values (8 bytes), texel i at bits 4*i..4*i+3
+
 		cTotalBlockFormats
 	};
 

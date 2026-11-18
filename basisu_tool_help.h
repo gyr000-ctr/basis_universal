@@ -38,7 +38,7 @@
 "\n"
 " -export_ktx <FORMAT>: Transcode each input .ktx2 to a compressed KTX1 (.ktx)\n"
 "  file (all mips, array layers, cubemap faces). FORMAT (compressed only): BC1\n"
-"  BC3 BC4 BC5 BC6H BC7 ETC1 ETC2 EAC_R11 EAC_RG11 PVRTC1 PVRTC2 ASTC ASTC_<WxH>\n"
+"  BC2 BC3 BC4 BC5 BC6H BC7 ETC1 ETC2 EAC_R11 EAC_RG11 PVRTC1 PVRTC2 ASTC ASTC_<WxH>\n"
 "  ASTC_HDR_4x4 ASTC_HDR_6x6. Output is <base>_<FORMAT>.ktx.\n"
 "\n"
 " -tinydds_info: Print header info (dimensions, type, mips, array slices, format)\n"
