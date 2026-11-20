@@ -181,6 +181,13 @@ namespace basisu
 	// BC formats writable to DDS (cTFBC1_RGB, cTFBC3_RGBA, cTFBC4_R, cTFBC5_RG,
 	// cTFBC6H, cTFBC7_RGBA) or uncompressed cTFRGBA32; any other format fails.
 	// Supports 2D, 2D arrays, cubemaps, and cubemap arrays (with or without mips).
+	// ETC1S textures with alpha are dual-slice (RGB slice + separate alpha slice per
+	// level/layer/face); their alpha goes to the output format's alpha channel (e.g.
+	// BC3's BC4 alpha block), for every mip, layer and face. For ETC1S, the slice
+	// structure is validated before transcoding: a table that can't hold one
+	// descriptor per (level, layer, face) fails with a "slice count mismatch" message,
+	// and a damaged descriptor (zero length, out-of-range offset/length, or an alpha
+	// slice that contradicts the DFD) fails with a "slice descriptor error" message.
 	// The transcoder need only have been init()'d -- this calls start_transcoding()
 	// itself. Returns false (and clears dds_data) on any error.
 	// srgb_mode selects whether the sRGB DDS format variants are used: -1 = auto

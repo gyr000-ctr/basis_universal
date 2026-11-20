@@ -2552,13 +2552,166 @@ namespace basisu
 		return true;
 	}
 
+	// ETC1S-only structural preflight for the DDS/KTX exporters. Runs BEFORE start_transcoding(), reading the
+	// ETC1S supercompression global data (SGD) directly out of the init()'d file buffer.
+	//
+	// An ETC1S texture with alpha is a dual-slice ("two slice") container: every (level, layer, face) has an RGB
+	// slice plus a separate alpha slice, each described by its own descriptor. The transcoder folds the alpha
+	// slice into the output format's alpha channel (for BC3, a BC4 block in front of the BC1 color block).
+	// Validating that structure here, ahead of the transcoder's own range checks, lets a damaged file fail with
+	// a message that names the exact problem instead of a generic "start_transcoding()/transcode failed".
+	//
+	// The error prefix identifies the failure class, so callers (and scripts) can tell them apart:
+	//   "slice count mismatch"  -- the SGD descriptor table can't hold one entry per (level, layer, face)
+	//   "slice descriptor ..."  -- an entry is present but damaged: zero length, an offset/length that runs
+	//                              past its level's data range, or an alpha slice that contradicts the DFD
+	// Returns false and fills err on failure; true (err untouched) when the texture is fine or isn't ETC1S.
+	static bool validate_etc1s_slices_for_export(basist::ktx2_transcoder& transcoder, std::string& err)
+	{
+		using namespace basist;
+
+		if (!transcoder.is_etc1s())
+			return true;
+
+		const ktx2_header& hdr = transcoder.get_header();
+		const uint32_t levels = transcoder.get_levels();
+		const uint32_t faces = transcoder.get_faces();
+		const uint32_t layers = maximum<uint32_t>(1, transcoder.get_layers());
+		const uint64_t expected_images = (uint64_t)levels * layers * faces;
+		const bool has_alpha = transcoder.get_has_alpha() != 0;
+
+		const uint64_t sgd_offset = hdr.m_sgd_byte_offset.get_uint64();
+		const uint64_t sgd_length = hdr.m_sgd_byte_length.get_uint64();
+
+		// An ETC1S texture's payload is only ever decodable when BASISLZ supercompression carries the global
+		// codebooks, so reject any other scheme up front. (init() doesn't validate the SGD offset/length for
+		// non-BASISLZ schemes, so this also keeps us from reading past the file buffer below.)
+		if (hdr.m_supercompression_scheme != KTX2_SS_BASISLZ)
+		{
+			err = string_format("unsupported ETC1S container: supercompression scheme %u (expected BASISLZ)",
+				(uint32_t)hdr.m_supercompression_scheme.get_uint64());
+			return false;
+		}
+
+		// Overflow-safe bounds check (the same form init() uses for the schemes it validates). Defense in
+		// depth: we read the ETC1S global data header straight out of the file buffer.
+		const uint64_t data_size = transcoder.get_data_size();
+		if ((sgd_offset > data_size) || (sgd_length > data_size - sgd_offset))
+		{
+			err = "slice descriptor error: ETC1S supercompression global data offset/length lies outside the file";
+			return false;
+		}
+
+		if (sgd_length < sizeof(ktx2_etc1s_global_data_header))
+		{
+			err = "slice descriptor error: ETC1S supercompression global data is too small to hold a header";
+			return false;
+		}
+
+		const basisu::vector<ktx2_level_index>& level_index = transcoder.get_level_index();
+
+		// Read the ETC1S global data header straight from the file buffer (all fields are little-endian).
+		// Layout: u16 endpoint_count, u16 selector_count, then four u32 byte lengths.
+		const uint8_t* sgd_base = transcoder.get_data() + sgd_offset;
+		const uint32_t ep_count = read_le_word(sgd_base + 0);
+		const uint32_t sel_count = read_le_word(sgd_base + 2);
+		const uint32_t ep_bytes = read_le_dword(sgd_base + 4);
+		const uint32_t sel_bytes = read_le_dword(sgd_base + 8);
+		const uint32_t tab_bytes = read_le_dword(sgd_base + 12);
+		const uint32_t ext_bytes = read_le_dword(sgd_base + 16);
+
+		if ((!ep_count) || (!sel_count) || (!ep_bytes) || (!sel_bytes) || (!tab_bytes))
+		{
+			err = "slice descriptor error: ETC1S global data header is invalid (zero endpoint/selector/table fields)";
+			return false;
+		}
+
+		// How many image descriptors the SGD blob can hold. This mirrors decompress_etc1s_global_data(): it
+		// needs sizeof(global header) + sizeof(desc)*image_count + the four table byte lengths to fit. Trailing
+		// bytes past that are tolerated (the transcoder ignores them too), but the table must hold every slice.
+		const uint64_t tables_total = (uint64_t)ep_bytes + sel_bytes + tab_bytes + ext_bytes;
+		const uint64_t descs_bytes_available =
+			(sgd_length >= sizeof(ktx2_etc1s_global_data_header) + tables_total)
+			? (sgd_length - sizeof(ktx2_etc1s_global_data_header) - tables_total)
+			: 0;
+		const uint64_t available_desc_count = descs_bytes_available / sizeof(ktx2_etc1s_image_desc);
+
+		if (available_desc_count < expected_images)
+		{
+			err = string_format("slice count mismatch: ETC1S global data holds %u image descriptor(s) (%u bytes) but the texture requires %u (level %u * layer %u * face %u)",
+				(uint32_t)available_desc_count, (uint32_t)descs_bytes_available, (uint32_t)expected_images, levels, layers, faces);
+			return false;
+		}
+
+		const uint8_t* desc_base = sgd_base + sizeof(ktx2_etc1s_global_data_header);
+		const uint32_t images_per_level = layers * faces;
+
+		// Descriptor byte offsets are relative to the containing mip level's data, and the transcoder hands
+		// (level_offset + slice_offset, slice_length) to the low-level ETC1S transcoder. Bound every slice
+		// against the level's on-disk byte length (BASISLZ levels are stored raw, not supercompressed).
+		for (uint32_t level = 0; level < levels; level++)
+		{
+			const uint64_t level_length = level_index[level].m_byte_length.get_uint64();
+
+			for (uint32_t i = 0; i < images_per_level; i++)
+			{
+				// ktx2_etc1s_image_desc: five little-endian u32 -- flags, rgb offset, rgb length, alpha offset, alpha length.
+				const uint8_t* dp = desc_base + (uint64_t)(level * images_per_level + i) * sizeof(ktx2_etc1s_image_desc);
+				const uint32_t rgb_slice_offset = read_le_dword(dp + 4);
+				const uint32_t rgb_slice_length = read_le_dword(dp + 8);
+				const uint32_t alpha_slice_offset = read_le_dword(dp + 12);
+				const uint32_t alpha_slice_length = read_le_dword(dp + 16);
+
+				if (!rgb_slice_length)
+				{
+					err = string_format("slice descriptor error: level %u image %u has a zero-length RGB slice", level, i);
+					return false;
+				}
+
+				if ((uint64_t)rgb_slice_offset + rgb_slice_length > level_length)
+				{
+					err = string_format("slice descriptor error: level %u image %u RGB slice (offset %u, length %u) runs past the level data range (%u bytes)",
+						level, i, rgb_slice_offset, rgb_slice_length, (uint32_t)level_length);
+					return false;
+				}
+
+				if (has_alpha)
+				{
+					if (!alpha_slice_length)
+					{
+						err = string_format("slice descriptor error: level %u image %u is missing its alpha slice (zero-length) on an alpha ETC1S texture", level, i);
+						return false;
+					}
+
+					if ((uint64_t)alpha_slice_offset + alpha_slice_length > level_length)
+					{
+						err = string_format("slice descriptor error: level %u image %u alpha slice (offset %u, length %u) runs past the level data range (%u bytes)",
+							level, i, alpha_slice_offset, alpha_slice_length, (uint32_t)level_length);
+						return false;
+					}
+				}
+				else if (alpha_slice_length)
+				{
+					// The descriptor advertises an alpha slice although the DFD says there is none. The low-level
+					// transcoder would ignore it, but the container is inconsistent -- reject rather than silently
+					// export a texture whose alpha provenance is unclear.
+					err = string_format("slice descriptor error: level %u image %u advertises an alpha slice (length %u) but the texture has no alpha plane",
+						level, i, alpha_slice_length);
+					return false;
+				}
+			}
+		}
+
+		return true;
+	}
+
 	// Shared by transcode_ktx2_to_dds()/transcode_ktx2_to_ktx(): transcodes every
 	// (array layer, cubemap face, mip level) of an already-start_transcoding()'d
 	// ktx2_transcoder to the block GPU format (fmt, with its basisu::texture_format
 	// equivalent bfmt) and builds the [slice][mip] gpu_image array the DDS/KTX
 	// writers consume. Slices are ordered layer-major then cubemap face. Returns
-	// false on any transcode failure.
-	static bool transcode_ktx2_to_block_image_slices(basist::ktx2_transcoder& transcoder, basist::transcoder_texture_format fmt, texture_format bfmt, basisu::vector<gpu_image_vec>& slices, uint32_t decode_flags)
+	// false on any transcode failure; err receives a specific message on failure.
+	static bool transcode_ktx2_to_block_image_slices(basist::ktx2_transcoder& transcoder, basist::transcoder_texture_format fmt, texture_format bfmt, basisu::vector<gpu_image_vec>& slices, uint32_t decode_flags, std::string& err)
 	{
 		using namespace basist;
 
@@ -2581,7 +2734,8 @@ namespace basisu
 					ktx2_image_level_info li;
 					if (!transcoder.get_image_level_info(li, level, layer, face))
 					{
-						error_printf("transcode_ktx2_to_block_image_slices: get_image_level_info(L%u, layer %u, face %u) failed\n", level, layer, face);
+						err = string_format("get_image_level_info(L%u, layer %u, face %u) failed", level, layer, face);
+						error_printf("transcode_ktx2_to_block_image_slices: %s\n", err.c_str());
 						return false;
 					}
 
@@ -2590,7 +2744,9 @@ namespace basisu
 
 					if (!transcoder.transcode_image_level(level, layer, face, gi.get_ptr(), gi.get_total_blocks(), fmt, decode_flags))
 					{
-						error_printf("transcode_ktx2_to_block_image_slices: transcode_image_level(L%u, layer %u, face %u) failed\n", level, layer, face);
+						err = string_format("transcode_image_level(L%u, layer %u, face %u) to %s failed (slice data is corrupted or truncated)",
+							level, layer, face, basis_get_format_name(fmt));
+						error_printf("transcode_ktx2_to_block_image_slices: %s\n", err.c_str());
 						return false;
 					}
 				}
@@ -2620,6 +2776,17 @@ namespace basisu
 		if (!basis_is_format_supported(fmt, transcoder.get_basis_tex_format()))
 		{
 			error_printf("transcode_ktx2_to_dds: output format \"%s\" isn't a supported transcode target for this input texture\n", basis_get_format_name(fmt));
+			return false;
+		}
+
+		// ETC1S dual-slice (RGB + alpha) structural validation, done before start_transcoding() so a damaged
+		// alpha texture fails here with a message that names the exact problem: "slice count mismatch" (the
+		// SGD can't hold one descriptor per level/layer/face) vs "slice descriptor error" (an entry is
+		// zero-length, points outside its level's data, or contradicts the DFD's alpha plane).
+		std::string slice_err;
+		if (!validate_etc1s_slices_for_export(transcoder, slice_err))
+		{
+			error_printf("transcode_ktx2_to_dds: %s\n", slice_err.c_str());
 			return false;
 		}
 
@@ -2690,7 +2857,8 @@ namespace basisu
 		else
 		{
 			basisu::vector<gpu_image_vec> slices;
-			if (!transcode_ktx2_to_block_image_slices(transcoder, fmt, bfmt, slices, decode_flags))
+			std::string transcode_err;
+			if (!transcode_ktx2_to_block_image_slices(transcoder, fmt, bfmt, slices, decode_flags, transcode_err))
 				return false;
 
 			if (!write_dds_file(dds_data, slices, cubemap_flag, srgb))
@@ -2771,6 +2939,15 @@ namespace basisu
 			return false;
 		}
 
+		// Same ETC1S dual-slice integrity check as the DDS exporter, run before start_transcoding() so a
+		// damaged alpha texture fails with a specific slice error instead of a generic transcode failure.
+		std::string slice_err;
+		if (!validate_etc1s_slices_for_export(transcoder, slice_err))
+		{
+			error_printf("transcode_ktx2_to_ktx: %s\n", slice_err.c_str());
+			return false;
+		}
+
 		if (!transcoder.start_transcoding())
 		{
 			error_printf("transcode_ktx2_to_ktx: start_transcoding() failed\n");
@@ -2793,7 +2970,8 @@ namespace basisu
 		}
 
 		basisu::vector<gpu_image_vec> slices;
-		if (!transcode_ktx2_to_block_image_slices(transcoder, fmt, bfmt, slices, decode_flags))
+		std::string transcode_err;
+		if (!transcode_ktx2_to_block_image_slices(transcoder, fmt, bfmt, slices, decode_flags, transcode_err))
 			return false;
 
 		if (!create_ktx_texture_file(ktx_data, slices, cubemap_flag, srgb))
