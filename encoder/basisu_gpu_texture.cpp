@@ -2993,25 +2993,47 @@ namespace basisu
 		}
 	}
 
+	// Appends buf[0,len) to out, escaping non-printable bytes as \xNN and capping the
+	// total shown at max_shown bytes (with a trailing "..." if anything was cut), so a
+	// hostile or corrupt KVD entry can't flood the output. For print_ktx_info().
+	static void ktx_append_escaped(std::string& out, const uint8_t* pBuf, size_t len, size_t max_shown)
+	{
+		const size_t shown = minimum<size_t>(len, max_shown);
+		for (size_t i = 0; i < shown; i++)
+		{
+			const uint8_t c = pBuf[i];
+			if ((c >= 0x20) && (c <= 0x7E) && (c != '"') && (c != '\\'))
+				out += (char)c;
+			else
+			{
+				char esc[8];
+				snprintf(esc, sizeof(esc), "\\x%02X", c);
+				out += esc;
+			}
+		}
+		if (shown < len)
+			out += "...";
+	}
+
 	bool print_ktx_info(const char* pFilename)
 	{
-		FILE* pFile = fopen_safe(pFilename, "rb");
-		if (!pFile)
+		uint8_vec file_data;
+		if (!read_file_to_vec(pFilename, file_data))
 		{
 			error_printf("Can't open .ktx file \"%s\"\n", pFilename);
 			return false;
 		}
 
-		ktx_header hdr;
-		hdr.clear();
-		const size_t n = fread(&hdr, 1, sizeof(hdr), pFile);
-		fclose(pFile);
-
-		if (n != sizeof(hdr))
+		if (file_data.size() < sizeof(ktx_header))
 		{
 			error_printf("Failed reading KTX header from \"%s\" (file too small)\n", pFilename);
 			return false;
 		}
+
+		ktx_header hdr;
+		// (void*) cast: packed_uint members have a user-defined operator=, which would
+		// otherwise trip -Wclass-memaccess. Bit-copying the raw header bytes is intended.
+		memcpy(static_cast<void*>(&hdr), file_data.data(), sizeof(hdr));
 
 		if (memcmp(hdr.m_identifier, g_ktx_file_id, sizeof(g_ktx_file_id)) != 0)
 		{
@@ -3074,6 +3096,180 @@ namespace basisu
 		printf("  numberOfFaces         : %u%s\n", faces, (faces == 6) ? "  (cubemap)" : "");
 		printf("  numberOfMipmapLevels  : %u\n", mip_levels);
 		printf("  bytesOfKeyValueData   : %u\n", kvd_bytes);
+
+		const uint64_t file_size = file_data.size();
+
+		// ---- Key/value data (KVD) ----
+		// The KVD region follows the 64-byte header: a sequence of
+		//   uint32 keyAndValueByteSize, byte keyAndValue[n] ("key\0value"), 0-3 pad bytes
+		// with each entry 4-byte aligned. Every read is bounds-checked against both the
+		// declared KVD region and the physical file size; anything malformed is a clean
+		// error, never an out-of-bounds access.
+		const uint64_t kvd_begin = sizeof(ktx_header);
+		const uint64_t kvd_end = kvd_begin + kvd_bytes;
+		if (kvd_end > file_size)
+		{
+			error_printf("File \"%s\" has truncated key/value data: header declares %u KVD bytes (ends at offset %llu) but the file is only %llu bytes\n",
+				pFilename, kvd_bytes, (unsigned long long)kvd_end, (unsigned long long)file_size);
+			return false;
+		}
+
+		// Hard caps so a corrupt size field can't make us spin or flood the output.
+		const uint32_t MAX_KVD_ENTRIES = 4096;
+		const size_t MAX_KVD_SHOWN = 96;
+
+		struct kvd_entry { std::string m_key, m_value; bool m_duplicate; };
+		basisu::vector<kvd_entry> entries;
+
+		uint64_t ofs = kvd_begin;
+		while (ofs < kvd_end)
+		{
+			if (entries.size() >= MAX_KVD_ENTRIES)
+			{
+				error_printf("File \"%s\" has too many KVD entries (>%u) -- corrupt file?\n", pFilename, MAX_KVD_ENTRIES);
+				return false;
+			}
+
+			if (kvd_end - ofs < 4)
+			{
+				error_printf("File \"%s\" has a malformed KVD: %llu leftover byte(s) at offset %llu, too small for an entry header\n",
+					pFilename, (unsigned long long)(kvd_end - ofs), (unsigned long long)ofs);
+				return false;
+			}
+
+			uint32_t kv_size;
+			memcpy(&kv_size, file_data.data() + ofs, sizeof(kv_size));
+			kv_size = rd(kv_size);
+			ofs += 4;
+
+			// kv_size must fit in the rest of the KVD region (this also rejects huge/corrupt sizes).
+			if ((uint64_t)kv_size > kvd_end - ofs)
+			{
+				error_printf("File \"%s\" has a malformed KVD: entry #%u declares keyAndValueByteSize=%u at offset %llu, past the end of the %u-byte KVD region\n",
+					pFilename, (uint32_t)entries.size(), kv_size, (unsigned long long)(ofs - 4), kvd_bytes);
+				return false;
+			}
+
+			const uint8_t* pKV = file_data.data() + ofs;
+
+			// The key is a NUL-terminated string at the start of keyAndValue; the NUL is required.
+			size_t key_len = 0;
+			while ((key_len < kv_size) && (pKV[key_len] != 0))
+				key_len++;
+			if (key_len == kv_size)
+			{
+				error_printf("File \"%s\" has a malformed KVD: entry #%u (offset %llu) has no NUL-terminated key within its %u byte(s)\n",
+					pFilename, (uint32_t)entries.size(), (unsigned long long)(ofs - 4), kv_size);
+				return false;
+			}
+
+			kvd_entry e;
+			ktx_append_escaped(e.m_key, pKV, key_len, MAX_KVD_SHOWN);
+			ktx_append_escaped(e.m_value, pKV + key_len + 1, kv_size - key_len - 1, MAX_KVD_SHOWN);
+			e.m_duplicate = false;
+			for (uint32_t i = 0; i < entries.size(); i++)
+			{
+				if (entries[i].m_key == e.m_key)
+				{
+					e.m_duplicate = true;
+					break;
+				}
+			}
+			entries.push_back(e);
+
+			// Advance past the entry including its 0-3 bytes of alignment padding. kv_size
+			// fits in the region (checked above); make sure the padding does too.
+			const uint64_t padded = ((uint64_t)kv_size + 3) & ~3ULL;
+			if (padded > kvd_end - ofs)
+			{
+				error_printf("File \"%s\" has a malformed KVD: entry #%u's 4-byte alignment padding runs past the end of the KVD region\n",
+					pFilename, (uint32_t)entries.size() - 1);
+				return false;
+			}
+			ofs += padded;
+		}
+
+		if (entries.empty())
+			printf("  Key/value data        : (none)\n");
+		else
+		{
+			printf("  Key/value data        : %u entr%s (%u bytes)\n", (uint32_t)entries.size(), entries.size() == 1 ? "y" : "ies", kvd_bytes);
+			for (uint32_t i = 0; i < entries.size(); i++)
+				printf("    [%u] \"%s\" = \"%s\"%s\n", i, entries[i].m_key.c_str(), entries[i].m_value.c_str(), entries[i].m_duplicate ? "  (duplicate key)" : "");
+		}
+
+		// ---- Image data ----
+		// Walk each mip level: uint32 imageSize followed by the level's data. basisu's own
+		// KTX1 writer stores the TOTAL level size in imageSize, except for a non-array
+		// cubemap where (per the KTX1 spec) imageSize is one face's size -- mirror that here.
+		// All sizes are computed in 64-bit and checked against the physical file size.
+		if ((faces != 1) && (faces != 6))
+		{
+			error_printf("File \"%s\" has an invalid numberOfFaces %u (must be 1 or 6)\n", pFilename, faces);
+			return false;
+		}
+
+		const uint32_t num_array = array_elements ? array_elements : 1;
+		uint32_t levels = mip_levels ? mip_levels : 1; // 0 means "not mipmapped" == 1 level
+		const uint32_t MAX_MIP_LEVELS = 4096;
+		if (levels > MAX_MIP_LEVELS)
+		{
+			error_printf("File \"%s\" declares an implausible numberOfMipmapLevels %u\n", pFilename, levels);
+			return false;
+		}
+
+		struct mip_info { uint32_t m_image_size; uint64_t m_data_ofs; };
+		basisu::vector<mip_info> mips;
+		uint64_t img_ofs = kvd_end;
+		for (uint32_t level = 0; level < levels; level++)
+		{
+			if (img_ofs + 4 > file_size)
+			{
+				error_printf("File \"%s\" has truncated image data: missing imageSize for mip level %u (offset %llu, file is %llu bytes)\n",
+					pFilename, level, (unsigned long long)img_ofs, (unsigned long long)file_size);
+				return false;
+			}
+
+			uint32_t image_size;
+			memcpy(&image_size, file_data.data() + img_ofs, sizeof(image_size));
+			image_size = rd(image_size);
+			img_ofs += 4;
+
+			uint64_t span = image_size;
+			if ((faces == 6) && (num_array == 1))
+				span *= 6; // spec cubemap: imageSize is per-face
+			span = (span + 3) & ~3ULL; // mipPadding (a no-op for the compressed formats basisu writes)
+
+			if (img_ofs + span > file_size)
+			{
+				error_printf("File \"%s\" has truncated image data: mip level %u needs %llu byte(s) at offset %llu but the file is only %llu bytes\n",
+					pFilename, level, (unsigned long long)span, (unsigned long long)img_ofs, (unsigned long long)file_size);
+				return false;
+			}
+
+			mip_info mi;
+			mi.m_image_size = image_size;
+			mi.m_data_ofs = img_ofs;
+			mips.push_back(mi);
+			img_ofs += span;
+		}
+
+		uint64_t total_img_bytes = (mips.size() ? (img_ofs - kvd_end) : 0);
+		printf("  Image data            : %u mip level%s, %llu bytes (offset %llu..%llu)\n",
+			(uint32_t)mips.size(), mips.size() == 1 ? "" : "s",
+			(unsigned long long)total_img_bytes, (unsigned long long)kvd_end, (unsigned long long)img_ofs);
+		const uint32_t MAX_MIPS_SHOWN = 32;
+		for (uint32_t level = 0; level < mips.size(); level++)
+		{
+			if (level == MAX_MIPS_SHOWN)
+			{
+				printf("    ... (%u more mip levels not shown)\n", (uint32_t)mips.size() - MAX_MIPS_SHOWN);
+				break;
+			}
+			printf("    mip %u: imageSize=%u, data offset %llu\n", level, mips[level].m_image_size, (unsigned long long)mips[level].m_data_ofs);
+		}
+		if (img_ofs < file_size)
+			printf("  Trailing data         : %llu byte(s) after the last mip level\n", (unsigned long long)(file_size - img_ofs));
 
 		return true;
 	}
